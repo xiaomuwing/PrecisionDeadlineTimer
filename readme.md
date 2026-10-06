@@ -10,7 +10,7 @@
 | 场景 | 判定 |
 | --- | --- |
 | 周期 ≥ 2 ms，允许偶发可观测的超期（容差 ≥ ±1 ms）：慢信号轮询、趋势记录、周期任务 | ✅ 推荐 |
-| 周期 1~2 ms | ⚠️ 边缘：忙等占空比约 50%，CPU 代价高 |
+| 周期 1~2 ms | ⚠️ 分平台：Windows 引擎受 0.5 ms 等待粒度限制，忙等占空比约 50%；Linux 引擎 + SCHED_FIFO 实测 1 kHz 可用（P99.9 0.12 ms，见"Linux 引擎"实测表） |
 | 周期 < 1 ms（>1 kHz） | ❌ 等待定时器粒度 0.5 ms，调度尖峰超过整个周期 |
 | 要求每周期 ±0.5 ms 硬保证 | ❌ P99.9 尾部来自操作系统抢占，软件无法消除 |
 | 等间隔波形采样、相位测量、多通道同步 | ❌ 软件回调间隔 ≠ 采样时刻，用设备硬件采样时钟 |
@@ -94,10 +94,131 @@ void OnTick(TimerTick tick)
 | 取消后 Run 不返回 | 回调正在执行阻塞操作 | 取消只能打断等待，不能中断已进入的回调 |
 | 系统睡眠/重启后时间线异常 | 设计行为 | 睡眠期算作跳过周期并计数，唤醒后回到原时间表 |
 
-验证与复测：项目的 Main 直接运行内置基准 `TimerBenchmark`（编译后执行
-`PrecisionDeadlineTimer.exe --help` 查看参数）。关键参数：`--interval-ms`、`--spin-ms`、
-`--min-spin-ms`、`--mmcss`、`--work-ms`（模拟回调负载）、`--warmup-seconds`、`--output`。
+验证与复测：解决方案分两个项目——`CrossPlatformTimer`（.NET 10 类库，装三个定时器类，
+输出 `CrossPlatformTimer.dll`）与 `TimerBenchmark`（.NET 10 控制台基准/测试程序，引用类库）。
+`dotnet build PrecisionDeadlineTimer.slnx -c Release` 后执行
+`TimerBenchmark/bin/Release/net10.0/TimerBenchmark --help` 查看参数。关键参数：`--interval-ms`、`--spin-ms`、
+`--min-spin-ms`、`--mmcss`、`--engine`、`--rt-priority`、`--work-ms`（模拟回调负载）、`--warmup-seconds`、`--output`。
 观测时看双侧指标：P99/P99.9 绝对周期误差、相对时间表相位偏差、唤醒迟到、跳过点数、CPU。
+其他项目引用定时器时只需引用 `CrossPlatformTimer` 类库（命名空间 `PrecisionDeadlineTimer`）。
+
+## Linux 引擎（LinuxNativeTimer）
+
+`LinuxNativeTimer` 是 Linux 原生定时引擎：timerfd(CLOCK_MONOTONIC) 周期定时 + eventfd 取消 +
+poll 等待，与 `PrecisionDeadlineTimer` 完全相同的 `Run(workAction, interval, token)` 契约和
+TimerTick 语义。基准程序用 `--engine auto|spin|linux` 选择引擎（`auto`：Linux 上默认 linux，
+其余平台默认 spin），采样、统计、CSV 输出管线两引擎共用。
+
+```bash
+# Linux 上实测 timerfd 引擎（auto 已默认选中，此处显式指定）
+./PrecisionDeadlineTimer --engine linux --interval-ms 10 --seconds 60 --warmup-seconds 5
+```
+
+与忙等引擎的差异：
+
+- 定时器在 Run 开始时才武装（timerfd_settime），时间表原点 = Run 起始时刻；
+- 取消由 CancellationToken 回调写 eventfd 完成，定时循环在调用线程上，无独立读取线程；
+- 错过周期由 timerfd 过期计数精确上报为 SkippedPeriods，不补发；
+- P/Invoke 全部使用 IntPtr/UIntPtr 尺寸类型，32/64 位 Linux 布局均正确；
+- 忙等窗口（`--spin-ms`，默认 0 = 纯内核等待）：timerfd 提前一个窗口唤醒，随后 SpinWait 守到截止点；
+  实时调度（`--rt-priority 1~99`，默认 0 = 关）：定时线程提升为 SCHED_FIFO，需 root 或
+  CAP_SYS_NICE（sudo 运行，或在 /etc/security/limits.conf 配置 rtprio），失败静默退化并打印警告。
+  `--min-spin-ms` / `--mmcss` 对该引擎无效。
+
+实测参考（WSL2 Ubuntu 24.04，2026-10，Release，10 ms 周期，30~60 秒）：
+
+| 配置 | 负载 | P99 误差 | P99.9 误差 | 最大迟到 | 跳过点 | CPU |
+| --- | --- | --- | --- | --- | --- | --- |
+| 纯内核等待 | 空载 | 0.575 ms | 0.928 ms | 5.6 ms | 14/60 s | 0.2% |
+| 忙等 1.5 ms | 空载 | 0.052 ms | 1.82 ms | 5.7 ms | 0 | 8.5% |
+| 忙等 1.5 ms | 12 线程打满 | 0.006 ms | 61.4 ms | 212.6 ms | 46/30 s | 8.7% |
+| 忙等 1.5 ms + SCHED_FIFO 50 | 12 线程打满 | 0.016 ms | 0.33 ms | 0.72 ms | 0 | ≈9% |
+| spin 引擎对照 | 空载 | 0.049 ms | 3.82 ms | 8.6 ms | 0 | 93.4% |
+| 1 kHz：忙等 0.3 ms + SCHED_FIFO 50 | 空载 | 0.047 ms | 0.42 ms | 1.2 ms | 42/30 s* | 12.8% |
+| 1 kHz：忙等 0.3 ms + SCHED_FIFO 50 | 12 线程打满 | 0.042 ms | 0.12 ms | 0.82 ms | 3/30 s | 8.1% |
+| **裸机 Linux**：忙等 15 ms + SCHED_FIFO 50（200 ms 周期，100 s） | 空载 | **0.0015 ms** | **0.0024 ms** | **0.0008 ms** | 0 | 7.4% |
+
+裸机 Linux 是这套引擎的真实上限：P99 1.5 µs、标准差 500 ns、100 秒漂移 −0.0001 ms、
+CPU 7.4% 与理论占空比 7.5% 精确吻合；同参数比裸机 Windows 11（P99 0.0635 ms）还准约 40 倍。
+
+*1 kHz 空载组的 42 个跳过点来自一次 Hyper-V 约 38 ms 的停顿（WSL2 虚拟化层的随机尖峰，裸机少见）；
+其余 1 kHz 指标均已进入 0.1 ms 内，1 kHz 在 Linux 引擎下可用。
+
+结论：忙等窗口把 P99 压到 0.05 ms 量级（与全程忙等的 spin 引擎持平，CPU 从 93% 降到 9%）；
+SCHED_FIFO 解决的是满载尾部——P99.9 从 61 ms 压到 0.33 ms、零跳过。两者叠加即推荐配置。
+WSL2 虚拟化环境下仍有 Hyper-V 调度停顿引入的偶发尖峰，裸机 Linux 会更好。
+
+## 跨平台封装（CrossPlatformTimer）
+
+`CrossPlatformTimer` 把两个引擎包成统一 API：Linux 自动路由到 `LinuxNativeTimer`，其余平台
+路由到 `PrecisionDeadlineTimer`，调用方一份代码两平台通用。基准程序的 `--engine auto`
+（默认）走的就是这层封装。
+
+```csharp
+using var cts = new CancellationTokenSource();
+
+var timer = new CrossPlatformTimer(
+    spinWindow: TimeSpan.FromMilliseconds(15),  // 两平台共用的忙等窗口
+    rtPriority: 50);                            // 仅 Linux 生效（SCHED_FIFO）；Windows 静默忽略
+
+var task = Task.Factory.StartNew(
+    () => timer.Run(OnTick, TimeSpan.FromMilliseconds(200), cts.Token),
+    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+```
+
+参数分两类：平台共用的 `spinWindow`；平台专属的 `latePolicy` / `rebaseAfter` / `useMmcss` /
+`minSpinWindow`（仅 Windows）与 `rtPriority`（仅 Linux）——专属参数在另一平台静默忽略、不抛异常。
+注意两引擎默认值不同：省略 `spinWindow` 时 Windows 用 1.5 ms 忙等、Linux 用纯内核等待；
+跨平台一致性要求高的场景请显式指定 `spinWindow`。`CrossPlatformTimer.EngineName` 可查询当前
+实际路由到的引擎（"linux" / "spin"）。
+
+## 双平台同机对比（2026-10，同一台机器，10 ms 周期、1.5 ms 窗口、测 30 秒）
+
+两边各自开启本平台的调度增强（Windows 用 MMCSS，Linux 用 SCHED_FIFO 50）；两侧平均周期均为
+10.0000 ms、全程零漂移、跳过点计数精确。Linux 侧运行于 WSL2 虚拟机。
+
+| 场景 | 指标 | Windows 11 原生（spin + MMCSS） | Linux（linux + SCHED_FIFO，WSL2） |
+| --- | --- | --- | --- |
+| 空载 | P99 / P99.9 误差 | 0.28 / 3.6~7.0 ms | **0.075 / 0.20 ms** |
+| 空载 | 最大唤醒迟到 | 5.6~8.8 ms | **1.05 ms** |
+| 空载 | CPU | 12% | **7.5%** |
+| 满载（12 线程） | P99 / P99.9 误差 | **0.006 / 0.063 ms** | 0.016 / 0.33 ms |
+| 满载（12 线程） | 最大唤醒迟到 | **0.11 ms** | 0.72 ms |
+| 满载（12 线程） | CPU | 13% | ≈9% |
+
+关键发现：**Windows 满载反而比空载好约 40 倍**。空载时核停车（core parking）与深层 C-state
+的退出延迟造成数 ms 级迟到，MMCSS 无法消除；满载时核心全程高频在线，唤醒即刻完成。
+Linux 侧的 SCHED_FIFO 是硬抢占保证，空满载都稳定，且 WSL2 的 vCPU 由 Hyper-V 持续调度，
+无核停车问题——空载下虚拟机里的 Linux 反而赢了裸机 Windows 一个量级。
+推论：Windows 空载数字会随电源策略显著改善；Linux 数字在裸机上只会更好。
+
+裸机复核（2026-10，用户实测）：同一引擎在裸机 Linux 上 200 ms 周期跑出 P99 0.0015 ms、
+最大 0.0024 ms、零跳过、100 秒漂移 −0.0001 ms——比裸机 Windows 同参数（P99 0.0635 ms）
+还准约 40 倍，证实 WSL2 的 2~4 ms 迟到完全是虚拟化层 vCPU 停车所致（同核保活实验可将
+WSL2 最大唤醒迟到从 3.5 ms 压到 0.36 ms，进一步佐证）。**精度验收必须在裸机上进行。**
+
+## 最佳实践
+
+### Windows（spin 引擎，默认）
+
+- 引擎无需显式选择（`auto` 在非 Linux 平台自动选 spin）；MMCSS 保持默认开启，
+  它会同时解除 Win11 对后台进程的定时器节流；
+- 忙等窗口按 `clamp(周期 × 7.5~10%, 2 ms, 15 ms)` 选取；省电场景用 `minSpinWindow` 自适应；
+- **空载/间歇负载必须处理电源管理**（本次实测的关键结论）：
+  `powercfg /setactive SCHEME_MIN` 切到高性能电源计划（高性能计划默认禁用核停车），
+  或接受空载时数 ms 级的偶发迟到；负载稳定的产线环境无此问题；
+- 回调纪律见"回调编写规范"：短小、不分配、不阻塞；监控 SkippedPeriods 告警。
+
+### Linux（linux 引擎）
+
+- 推荐配置：`--engine linux --spin-ms <周期 × 15~30%> --rt-priority 50`；
+  纯内核等待（不开窗口）仅用于精度要求宽松（±1 ms）且极致省电的场景；
+- SCHED_FIFO 权限三选一：sudo 运行；`/etc/security/limits.conf` 加 `<用户> - rtprio 50`；
+  systemd 服务加 `LimitRTPRIO=50`。无权限时静默退化为普通调度（P99 不受损，满载尾部受损）；
+- 进一步收尾部：`taskset -c N` 绑核；裸机可用内核参数 `isolcpus` 隔离专用核；
+  <100 µs 级硬实时需求换 PREEMPT_RT 内核；
+- 生产环境避免 WSL2/虚拟机：虚拟化层会注入不可控的数 ms~数十 ms 尖峰（本次观测到 38 ms
+  级 Hyper-V 停顿）；必须在 VM 中运行时，监控 SkippedPeriods 并按其告警。
 
 ## 实测性能参考（本机 Windows 11，2026-10，Release，MMCSS 开）
 

@@ -17,14 +17,14 @@ internal static class TimerBenchmark
             {
                 Console.WriteLine("参数: --seconds 200 --interval-ms 200 " +
                     "--spin-ms 15 --min-spin-ms 15 --mmcss true --work-ms 0 --priority normal|above " +
-                    "--late-policy keep|rebase " +
+                    "--late-policy keep|rebase --engine auto|spin|linux --rt-priority 0 " +
                     "--rebase-after-ms 0.1 --warmup-seconds 20 --tolerance-ms 0.5 --output samples.csv");
                 return 0;
             }
             var options = new Dictionary<string, string>();
             var allowed = new HashSet<string> { "--seconds", "--interval-ms", "--spin-ms",
                 "--work-ms", "--priority", "--output", "--late-policy", "--rebase-after-ms", "--warmup-seconds", "--tolerance-ms",
-                "--min-spin-ms", "--mmcss" };
+                "--min-spin-ms", "--mmcss", "--engine", "--rt-priority" };
             for (int index = 0; index < args.Length; index += 2)
             {
                 if (index + 1 >= args.Length || !allowed.Contains(args[index]))
@@ -63,12 +63,39 @@ internal static class TimerBenchmark
                 "above" => ThreadPriority.AboveNormal,
                 _ => throw new ArgumentException("--priority 必须是 normal 或 above。")
             };
+            string engineName = options.GetValueOrDefault("--engine", "auto");
+            bool useLinux = engineName switch
+            {
+                // auto：Linux 上默认走 timerfd 引擎，其余平台走忙等引擎。
+                "auto" => OperatingSystem.IsLinux(),
+                "spin" => false,
+                "linux" => true,
+                _ => throw new ArgumentException("--engine 必须是 auto、spin 或 linux。")
+            };
+            int rtPriority = (int)Number(options, "--rt-priority", 0, 0, 99);
 
             Console.WriteLine($"目标 {intervalMs:F3} ms；预热 {warmupSeconds:F2} 秒、测量 {seconds:F2} 秒；" +
                 $"模拟工作 {workMs:F3} ms；优先级 {priorityName}。");
-            Console.WriteLine(minSpinMs < spinMs
-                ? $"定时线程不逐次打印；忙等窗口在 {Math.Min(minSpinMs, intervalMs):F3}～{Math.Min(spinMs, intervalMs):F3} ms/周期间自适应。"
-                : $"定时线程不逐次打印；最多忙等 {Math.Min(spinMs, intervalMs):F3} ms/周期。");
+            if (useLinux)
+            {
+                Console.WriteLine(spinMs > 0
+                    ? $"定时引擎: linux（timerfd + eventfd + poll，内核提前唤醒 + 忙等 {Math.Min(spinMs, intervalMs):F3} ms/周期）。"
+                    : "定时引擎: linux（timerfd + eventfd + poll，纯内核等待，无忙等窗口）。");
+                Console.WriteLine(rtPriority > 0
+                    ? $"实时调度: SCHED_FIFO 优先级 {rtPriority}（需 root 或 CAP_SYS_NICE，失败自动退化）。"
+                    : "实时调度: 关（--rt-priority 1~99 可启用 SCHED_FIFO）。");
+                if (!mmcss || minSpinMs != spinMs)
+                    Console.WriteLine("注意：--min-spin-ms / --mmcss 仅对 spin 引擎有效，linux 引擎下被忽略。");
+            }
+            else
+            {
+                Console.WriteLine(minSpinMs < spinMs
+                    ? $"定时引擎: spin（忙等窗口在 {Math.Min(minSpinMs, intervalMs):F3}～{Math.Min(spinMs, intervalMs):F3} ms/周期间自适应）。"
+                    : $"定时引擎: spin（最多忙等 {Math.Min(spinMs, intervalMs):F3} ms/周期）。");
+                if (rtPriority > 0)
+                    Console.WriteLine("注意：--rt-priority 仅对 linux 引擎有效，spin 引擎下被忽略。");
+            }
+            Console.WriteLine("定时线程不逐次打印。");
             Console.WriteLine($"迟到策略: {latePolicyName}，重排阈值 {rebaseAfterMs:F3} ms；" +
                 $"MMCSS: {(mmcss ? "开" : "关")}。");
 
@@ -80,7 +107,7 @@ internal static class TimerBenchmark
                 Console.WriteLine($"\n正在运行，约需 {seconds + warmupSeconds:F1} 秒，Ctrl+C 可停止。");
                 await MeasureAsync(seconds, warmupSeconds, toleranceMs, intervalMs, spinMs,
                     minSpinMs, mmcss, workMs,
-                    priority, latePolicy, rebaseAfterMs, options.GetValueOrDefault("--output"), cancellation.Token);
+                    priority, latePolicy, rebaseAfterMs, useLinux, rtPriority, engineName, options.GetValueOrDefault("--output"), cancellation.Token);
             }
             finally { Console.CancelKeyPress -= cancelHandler; }
             return 0;
@@ -104,7 +131,7 @@ internal static class TimerBenchmark
 
     private static async Task MeasureAsync(double seconds, double warmupSeconds, double toleranceMs, double intervalMs,
         double spinMs, double minSpinMs, bool mmcss, double workMs, ThreadPriority priority, LatePolicy latePolicy,
-        double rebaseAfterMs, string? output, CancellationToken token)
+        double rebaseAfterMs, bool useLinux, int rtPriority, string engineName, string? output, CancellationToken token)
     {
         // 按四倍理论采样数预分配，避免测量线程上的 List 扩容和逐周期分配。
         double requestedCapacity = Math.Ceiling(seconds * 1000 / intervalMs) * 4 + 32;
@@ -150,9 +177,17 @@ internal static class TimerBenchmark
             while (Stopwatch.GetTimestamp() < workEnd) Thread.SpinWait(16);
         }
 
-        var timer = new PrecisionDeadlineTimer(TimeSpan.FromMilliseconds(spinMs), latePolicy,
-            TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs));
-        await Task.Factory.StartNew(() => timer.Run(Record, TimeSpan.FromMilliseconds(intervalMs),
+        // 三个选项共用同一套采样与统计管线：Run 契约一致（同步回调 TimerTick，取消后返回）。
+        // auto 走跨平台封装层 CrossPlatformTimer（内部按 OS 路由）；显式指定则直连对应引擎。
+        Action<Action<TimerTick>, TimeSpan, CancellationToken> runLoop = engineName switch
+        {
+            "auto" => new CrossPlatformTimer(TimeSpan.FromMilliseconds(spinMs), latePolicy,
+                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs), rtPriority).Run,
+            "linux" => new LinuxNativeTimer(TimeSpan.FromMilliseconds(spinMs), rtPriority).Run,
+            _ => new PrecisionDeadlineTimer(TimeSpan.FromMilliseconds(spinMs), latePolicy,
+                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs)).Run,
+        };
+        await Task.Factory.StartNew(() => runLoop(Record, TimeSpan.FromMilliseconds(intervalMs),
             localCancellation.Token), CancellationToken.None, TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 

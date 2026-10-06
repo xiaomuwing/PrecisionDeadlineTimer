@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <Description>跨平台高精度定时器：Windows 高分辨率等待定时器 + 忙等（PrecisionDeadlineTimer）、Linux timerfd 原生引擎（LinuxNativeTimer）、跨平台统一封装（CrossPlatformTimer）。</Description>
+  </PropertyGroup>
+
+</Project>

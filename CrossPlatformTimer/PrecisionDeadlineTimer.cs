@@ -245,7 +245,9 @@ public sealed class PrecisionDeadlineTimer
         public void Arm(long dueTime)
         {
             if (!SetWaitableTimerEx(SafeWaitHandle, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0))
+            {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
         }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
@@ -253,6 +255,5 @@ public sealed class PrecisionDeadlineTimer
         [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool SetWaitableTimerEx(SafeWaitHandle timer, ref long dueTime, int period, IntPtr completionRoutine, IntPtr argument, IntPtr wakeContext, uint tolerableDelay);
-    
     }
 }
