@@ -1,9 +1,24 @@
-# PrecisionDeadlineTimer 使用说明
+# PrecisionDeadlineTimer
 
-固定时间表的软实时定时器（.NET，Windows 优化）。Windows 10 1803+ 用
-`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 高分辨率等待定时器睡到截止点前，最后一段忙等守点；
-时间表锚定在启动时刻（第 N 次截止点 = 起始时刻 + N × 周期），抖动不累积，长期零漂移；
-超期的时间点只计数、不补发。
+跨平台高精度软实时定时器（.NET 10）。固定时间表语义：时间表锚定在启动时刻
+（第 N 次截止点 = 起始时刻 + N × 周期），抖动不累积，长期零漂移；超期的时间点只计数、不补发。
+Windows 用 `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` 高分辨率等待定时器睡到截止点前、最后一段忙等守点；
+Linux 用 timerfd(CLOCK_MONOTONIC) 内核周期定时 + 可选忙等窗口 + 可选 SCHED_FIFO 实时调度。
+
+实测精度（10~200 ms 周期）：裸机 Linux P99 达 0.0015 ms，Windows 满载 P99 0.006 ms，
+详见下文"实测性能参考"与"双平台同机对比"。
+
+## 项目结构
+
+| 项目 | 类型 | 内容 |
+| --- | --- | --- |
+| `CrossPlatformTimer/` | .NET 10 类库（`CrossPlatformTimer.dll`，命名空间 `PrecisionDeadlineTimer`） | 三个定时器类：`CrossPlatformTimer`（跨平台封装，推荐入口）、`PrecisionDeadlineTimer`（Windows 引擎）、`LinuxNativeTimer`（Linux 引擎） |
+| `TimerBenchmark/` | .NET 10 控制台基准/测试程序 | 引用类库，双引擎共用的采样、统计、CSV 输出管线 |
+
+```
+dotnet build PrecisionDeadlineTimer.slnx -c Release
+TimerBenchmark/bin/Release/net10.0/TimerBenchmark --help
+```
 
 ## 适用边界
 
@@ -16,17 +31,21 @@
 | 等间隔波形采样、相位测量、多通道同步 | ❌ 软件回调间隔 ≠ 采样时刻，用设备硬件采样时钟 |
 
 长期运行注意：相对自身时间表零漂移；相对 UTC 存在晶振 ppm 误差（约 ±12~60 秒/周，
-恒定速率，可标定补偿）。QPC 为单调时钟，NTP 校时和系统改时间不影响它。
+恒定速率，可标定补偿）。QPC（Windows）与 CLOCK_MONOTONIC（Linux）均为单调时钟，NTP 校时和系统改时间不影响它们。
 
 ## 快速开始
 
+引用 `CrossPlatformTimer` 类库后，推荐用跨平台封装作为入口（Linux 自动走 timerfd 引擎，
+Windows 自动走忙等引擎）：
+
 ```csharp
+using PrecisionDeadlineTimer;
 using var cts = new CancellationTokenSource();
 
-// 200 ms 周期示例：窗口取周期的 7.5%
-var timer = new PrecisionDeadlineTimer(
+// 200 ms 周期示例：忙等窗口取周期的 7.5%；rtPriority 仅 Linux 生效
+var timer = new CrossPlatformTimer(
     spinWindow: TimeSpan.FromMilliseconds(15),
-    useMmcss: true);
+    rtPriority: 50);
 
 var task = Task.Factory.StartNew(
     () => timer.Run(OnTick, TimeSpan.FromMilliseconds(200), cts.Token),
@@ -41,10 +60,13 @@ void OnTick(TimerTick tick)
 }
 ```
 
+只在 Windows 上跑、需要 MMCSS / 自适应窗口等 Windows 专属能力时，可直接用 `PrecisionDeadlineTimer`
+（参数见下表）；只跑 Linux 且要显式控制 timerfd 行为时用 `LinuxNativeTimer`。
+
 `Run` 在调用线程上阻塞运行，取消后返回；务必用 `TaskCreationOptions.LongRunning` 给它独立线程。
 回调中抛出的异常沿 Run 的调用线程传出。
 
-## 构造参数
+## 构造参数（Windows 引擎 PrecisionDeadlineTimer）
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
@@ -94,13 +116,9 @@ void OnTick(TimerTick tick)
 | 取消后 Run 不返回 | 回调正在执行阻塞操作 | 取消只能打断等待，不能中断已进入的回调 |
 | 系统睡眠/重启后时间线异常 | 设计行为 | 睡眠期算作跳过周期并计数，唤醒后回到原时间表 |
 
-验证与复测：解决方案分两个项目——`CrossPlatformTimer`（.NET 10 类库，装三个定时器类，
-输出 `CrossPlatformTimer.dll`）与 `TimerBenchmark`（.NET 10 控制台基准/测试程序，引用类库）。
-`dotnet build PrecisionDeadlineTimer.slnx -c Release` 后执行
-`TimerBenchmark/bin/Release/net10.0/TimerBenchmark --help` 查看参数。关键参数：`--interval-ms`、`--spin-ms`、
+验证与复测：用 `TimerBenchmark` 控制台程序（结构见上文"项目结构"）。关键参数：`--interval-ms`、`--spin-ms`、
 `--min-spin-ms`、`--mmcss`、`--engine`、`--rt-priority`、`--work-ms`（模拟回调负载）、`--warmup-seconds`、`--output`。
 观测时看双侧指标：P99/P99.9 绝对周期误差、相对时间表相位偏差、唤醒迟到、跳过点数、CPU。
-其他项目引用定时器时只需引用 `CrossPlatformTimer` 类库（命名空间 `PrecisionDeadlineTimer`）。
 
 ## Linux 引擎（LinuxNativeTimer）
 
@@ -111,7 +129,7 @@ TimerTick 语义。基准程序用 `--engine auto|spin|linux` 选择引擎（`au
 
 ```bash
 # Linux 上实测 timerfd 引擎（auto 已默认选中，此处显式指定）
-./PrecisionDeadlineTimer --engine linux --interval-ms 10 --seconds 60 --warmup-seconds 5
+./TimerBenchmark --engine linux --interval-ms 10 --seconds 60 --warmup-seconds 5
 ```
 
 与忙等引擎的差异：
