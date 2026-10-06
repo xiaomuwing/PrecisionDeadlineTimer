@@ -16,7 +16,7 @@ internal static class TimerBenchmark
             if (args.Contains("--help"))
             {
                 Console.WriteLine("参数: --seconds 200 --interval-ms 200 " +
-                    "--spin-ms 15 --min-spin-ms 15 --mmcss true --work-ms 0 --priority normal|above " +
+                    "--spin-ms 15 --min-spin-ms 15 --mmcss true --mmcss-priority normal|high|critical --work-ms 0 --priority normal|above " +
                     "--late-policy keep|rebase --engine auto|spin|linux --rt-priority 0 " +
                     "--rebase-after-ms 0.1 --warmup-seconds 20 --tolerance-ms 0.5 --output samples.csv");
                 return 0;
@@ -24,7 +24,7 @@ internal static class TimerBenchmark
             var options = new Dictionary<string, string>();
             var allowed = new HashSet<string> { "--seconds", "--interval-ms", "--spin-ms",
                 "--work-ms", "--priority", "--output", "--late-policy", "--rebase-after-ms", "--warmup-seconds", "--tolerance-ms",
-                "--min-spin-ms", "--mmcss", "--engine", "--rt-priority" };
+                "--min-spin-ms", "--mmcss", "--mmcss-priority", "--engine", "--rt-priority" };
             for (int index = 0; index < args.Length; index += 2)
             {
                 if (index + 1 >= args.Length || !allowed.Contains(args[index]))
@@ -46,6 +46,14 @@ internal static class TimerBenchmark
                 "true" => true,
                 "false" => false,
                 _ => throw new ArgumentException("--mmcss 必须是 true 或 false。")
+            };
+            string mmcssPriorityName = options.GetValueOrDefault("--mmcss-priority", "normal");
+            WindowsMmcssPriority mmcssPriority = mmcssPriorityName switch
+            {
+                "normal" => WindowsMmcssPriority.Normal,
+                "high" => WindowsMmcssPriority.High,
+                "critical" => WindowsMmcssPriority.Critical,
+                _ => throw new ArgumentException("--mmcss-priority 必须是 normal、high 或 critical。")
             };
             double workMs = Number(options, "--work-ms", 0, 0, 60000);
             string latePolicyName = options.GetValueOrDefault("--late-policy", "keep");
@@ -97,7 +105,7 @@ internal static class TimerBenchmark
             }
             Console.WriteLine("定时线程不逐次打印。");
             Console.WriteLine($"迟到策略: {latePolicyName}，重排阈值 {rebaseAfterMs:F3} ms；" +
-                $"MMCSS: {(mmcss ? "开" : "关")}。");
+                $"MMCSS: {(mmcss ? "开" : "关")}，相对优先级 {mmcssPriorityName}（仅 Windows）。");
 
             using var cancellation = new CancellationTokenSource();
             ConsoleCancelEventHandler cancelHandler = (_, e) => { e.Cancel = true; cancellation.Cancel(); };
@@ -106,7 +114,7 @@ internal static class TimerBenchmark
             {
                 Console.WriteLine($"\n正在运行，约需 {seconds + warmupSeconds:F1} 秒，Ctrl+C 可停止。");
                 await MeasureAsync(seconds, warmupSeconds, toleranceMs, intervalMs, spinMs,
-                    minSpinMs, mmcss, workMs,
+                    minSpinMs, mmcss, mmcssPriority, workMs,
                     priority, latePolicy, rebaseAfterMs, useLinux, rtPriority, engineName, options.GetValueOrDefault("--output"), cancellation.Token);
             }
             finally { Console.CancelKeyPress -= cancelHandler; }
@@ -130,7 +138,7 @@ internal static class TimerBenchmark
     }
 
     private static async Task MeasureAsync(double seconds, double warmupSeconds, double toleranceMs, double intervalMs,
-        double spinMs, double minSpinMs, bool mmcss, double workMs, ThreadPriority priority, LatePolicy latePolicy,
+        double spinMs, double minSpinMs, bool mmcss, WindowsMmcssPriority mmcssPriority, double workMs, ThreadPriority priority, LatePolicy latePolicy,
         double rebaseAfterMs, bool useLinux, int rtPriority, string engineName, string? output, CancellationToken token)
     {
         // 按四倍理论采样数预分配，避免测量线程上的 List 扩容和逐周期分配。
@@ -154,7 +162,9 @@ internal static class TimerBenchmark
             long now = Stopwatch.GetTimestamp();
             if (measurementStart == 0)
             {
-                Thread.CurrentThread.Priority = priority;
+                // Windows 的普通线程优先级必须先于 MMCSS 注册设置，避免在首个回调中覆盖注册后的等级。
+                // 保留其他平台已有的设置时机。
+                if (!OperatingSystem.IsWindows()) Thread.CurrentThread.Priority = priority;
                 measurementStart = checked(now + (long)Math.Round(warmupSeconds * frequency));
                 measurementEnd = checked(measurementStart + (long)Math.Round(seconds * frequency));
             }
@@ -182,13 +192,18 @@ internal static class TimerBenchmark
         Action<Action<TimerTick>, TimeSpan, CancellationToken> runLoop = engineName switch
         {
             "auto" => new CrossPlatformTimer(TimeSpan.FromMilliseconds(spinMs), latePolicy,
-                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs), rtPriority).Run,
+                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs), rtPriority)
+                { MmcssPriority = mmcssPriority }.Run,
             "linux" => new LinuxNativeTimer(TimeSpan.FromMilliseconds(spinMs), rtPriority).Run,
             _ => new PrecisionDeadlineTimer(TimeSpan.FromMilliseconds(spinMs), latePolicy,
-                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs)).Run,
+                TimeSpan.FromMilliseconds(rebaseAfterMs), mmcss, TimeSpan.FromMilliseconds(minSpinMs))
+                { MmcssPriority = mmcssPriority }.Run,
         };
-        await Task.Factory.StartNew(() => runLoop(Record, TimeSpan.FromMilliseconds(intervalMs),
-            localCancellation.Token), CancellationToken.None, TaskCreationOptions.LongRunning,
+        await Task.Factory.StartNew(() =>
+        {
+            if (OperatingSystem.IsWindows()) Thread.CurrentThread.Priority = priority;
+            runLoop(Record, TimeSpan.FromMilliseconds(intervalMs), localCancellation.Token);
+        }, CancellationToken.None, TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
 
         double elapsedSeconds = (Stopwatch.GetTimestamp() - wallStart) / (double)frequency;
@@ -233,6 +248,8 @@ internal static class TimerBenchmark
         Console.WriteLine($"最大采集间隔: {intervals.Max() / intervalMs:F2} 个标称周期（不代表已补回过去的样本）。");
         Console.WriteLine($"相对时间表的 P99 绝对偏差: {Percentile(phase.Select(Math.Abs).ToArray(), 0.99):F4} ms");
         Console.WriteLine($"相对时间表的最大绝对偏差: {phase.Max(Math.Abs):F4} ms");
+        int phaseViolations = phase.Count(value => Math.Abs(value) > toleranceMs);
+        Console.WriteLine($"相对时间表 |偏差| > {toleranceMs:F3} ms: {phaseViolations} / {count} 个采样点（{phaseViolations * 100.0 / count:F4}%）。");
         Console.WriteLine($"末次相位 - 首次相位: {phase[^1] - phase[0]:F4} ms");
         double fixedTimelineDrift = ((samples[count - 1].Timestamp - samples[0].Timestamp) -
             ((count - 1L) + skippedTotal - samples[0].Skipped) * period) * toMs;

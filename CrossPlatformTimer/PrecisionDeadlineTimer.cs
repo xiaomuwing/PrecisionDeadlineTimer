@@ -14,6 +14,19 @@ public enum LatePolicy
     Rebase
 }
 
+/// <summary>Windows MMCSS 任务内的相对线程优先级；不改变进程优先级。</summary>
+public enum WindowsMmcssPriority
+{
+    /// <summary>低优先级。</summary>
+    Low = -1,
+    /// <summary>普通优先级，保持原默认行为。</summary>
+    Normal = 0,
+    /// <summary>高优先级。</summary>
+    High = 1,
+    /// <summary>关键任务优先级；适用于短小、无阻塞的定时回调。</summary>
+    Critical = 2
+}
+
 /// <summary>
 /// 每次触发传给回调的数据。所有时间戳单位均为 <see cref="Stopwatch.Frequency"/> 对应的 tick，可除以它换算为秒。
 /// </summary>
@@ -42,7 +55,8 @@ public sealed class PrecisionDeadlineTimer
 {
     /// <summary>
     /// 忙等窗口上限：每个周期最后这段时间内用 <see cref="Thread.SpinWait(int)"/> 守着截止点。
-    /// 成本约为 SpinWindow ÷ 周期的 CPU 占空比；实测甜点约为周期的 7.5%～10%，绝对值建议钳在 2～15 ms。
+    /// 实际窗口不超过周期；回调工作很少时理论忙等占空比约为窗口 ÷ 周期（一个逻辑核为 100%）。
+    /// 按目标机器的等待返回延迟与 CPU 预算复测选取，窗口与周期没有必须遵守的固定比例。
     /// </summary>
     public TimeSpan SpinWindow { get; }
     /// <summary>迟到处理方式，见 LatePolicy 枚举。</summary>
@@ -51,17 +65,32 @@ public sealed class PrecisionDeadlineTimer
     public TimeSpan RebaseAfter { get; }
     /// <summary>是否在 Run 期间为调用线程注册 MMCSS "Pro Audio" 调度类，并解除 Windows 11 对后台进程的定时器节流（仅 Windows，失败时静默退化；节流解除为进程级设置，Run 退出后不恢复）。</summary>
     public bool UseMmcss { get; }
-    /// <summary>自适应忙等窗口的下限；等于 SpinWindow 时窗口固定。注意下限过小（&lt;0.5 ms）会因唤醒频繁出窗而显著损失精度。</summary>
+    /// <summary>自适应忙等窗口的下限；等于 SpinWindow 时窗口固定。缩小窗口可能增加等待晚返回造成的误差，需在目标机器上验证。</summary>
     public TimeSpan MinSpinWindow { get; }
+
+    private WindowsMmcssPriority _mmcssPriority;
+    /// <summary>
+    /// MMCSS 任务内的相对优先级，默认 Normal。UseMmcss 为 true 且注册成功时生效；
+    /// 提高优先级可减少普通线程抢占，不能避免系统中断或保证最坏延迟。设置失败时保持已注册的调度等级。
+    /// </summary>
+    public WindowsMmcssPriority MmcssPriority
+    {
+        get => _mmcssPriority;
+        init
+        {
+            if (!Enum.IsDefined(value)) throw new ArgumentOutOfRangeException(nameof(MmcssPriority));
+            _mmcssPriority = value;
+        }
+    }
 
     private const uint ProcessPowerThrottlingCurrentVersion = 1;
     private const uint ProcessPowerThrottlingIgnoreTimerResolution = 0x4;
     private const int ProcessPowerThrottlingClass = 4;
     /// <summary>
-    /// 创建固定时间表定时器。所有参数均可省略，默认值即实测推荐配置。
+    /// 创建固定时间表定时器。所有参数均可省略，具体精度需在目标机器和回调负载下验证。
     /// </summary>
-    /// <param name="spinWindow">忙等窗口上限，默认 1.5 ms。成本约为 spinWindow ÷ 周期的 CPU 占空比；
-    /// 实测甜点约为周期的 7.5%～10%，绝对值建议钳在 2～15 ms（小于 2 ms 会频繁晚醒出窗，大于 15 ms 无收益）。</param>
+    /// <param name="spinWindow">忙等窗口上限，默认 1.5 ms，实际不超过周期。
+    /// 理论忙等占空比约为窗口 ÷ 周期；应依据实测等待返回延迟与 CPU 预算调整，不能由窗口大小保证最坏精度。</param>
     /// <param name="latePolicy">迟到处理方式，默认 <see cref="LatePolicy.KeepSchedule"/>。</param>
     /// <param name="rebaseAfter">Rebase 策略的重排阈值，默认 0.1 ms；KeepSchedule 策略下无效。</param>
     /// <param name="useMmcss">是否为定时线程注册 MMCSS "Pro Audio" 并解除后台进程定时器节流，默认 true。</param>
@@ -129,6 +158,8 @@ public sealed class PrecisionDeadlineTimer
         {
             uint taskIndex = 0;
             mmcss = AvSetMmThreadCharacteristicsW("Pro Audio", ref taskIndex);
+            if (mmcss != IntPtr.Zero && MmcssPriority != WindowsMmcssPriority.Normal)
+                _ = AvSetMmThreadPriority(mmcss, (int)MmcssPriority);
             var throttling = new PowerThrottlingState
             {
                 Version = ProcessPowerThrottlingCurrentVersion,
@@ -225,6 +256,9 @@ public sealed class PrecisionDeadlineTimer
     private static extern IntPtr GetCurrentProcess();
     [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+    [DllImport("avrt.dll", SetLastError = true, ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AvSetMmThreadPriority(IntPtr mmcssHandle, int priority);
     [DllImport("avrt.dll", SetLastError = true, ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool AvRevertMmThreadCharacteristics(IntPtr mmcssHandle);

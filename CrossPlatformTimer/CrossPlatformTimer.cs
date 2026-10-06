@@ -9,7 +9,7 @@ namespace PrecisionDeadlineTimer;
 /// </summary>
 /// <remarks>
 /// 参数分两类：平台共用的（spinWindow）与平台专属的——
-/// latePolicy / rebaseAfter / useMmcss / minSpinWindow 仅 Windows 引擎有效，
+/// latePolicy / rebaseAfter / useMmcss / minSpinWindow / MmcssPriority 仅 Windows 引擎有效，
 /// rtPriority 仅 Linux 引擎有效；专属参数在另一平台上被静默忽略（不抛异常）。
 /// 注意两个引擎的语义差异：Windows 引擎的忙等窗口默认开启（1.5 ms），
 /// Linux 引擎默认纯内核等待（窗口 0）；跨平台部署时建议显式指定 spinWindow 以获得一致行为。
@@ -27,6 +27,8 @@ public sealed class CrossPlatformTimer
     public TimeSpan RebaseAfter { get; }
     /// <summary>是否注册 MMCSS "Pro Audio" 调度类并解除 Win11 后台节流（仅 Windows 引擎）。</summary>
     public bool UseMmcss { get; }
+    /// <summary>MMCSS 任务内相对优先级（仅 Windows），默认 Normal；仅 UseMmcss 开启时生效。</summary>
+    public WindowsMmcssPriority MmcssPriority { get; init; } = WindowsMmcssPriority.Normal;
     /// <summary>自适应忙等窗口下限（仅 Windows 引擎）；null 表示与 SpinWindow 相等（固定窗口）。</summary>
     public TimeSpan? MinSpinWindow { get; }
     /// <summary>SCHED_FIFO 实时优先级 1~99（仅 Linux 引擎）；0（默认）不提升，无权限时静默退化。</summary>
@@ -82,6 +84,7 @@ public sealed class CrossPlatformTimer
         else
         {
             new PrecisionDeadlineTimer(SpinWindow, LatePolicy, RebaseAfter, UseMmcss, MinSpinWindow)
+                { MmcssPriority = MmcssPriority }
                 .Run(workAction, interval, token);
         }
     }

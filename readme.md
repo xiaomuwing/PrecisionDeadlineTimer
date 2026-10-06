@@ -42,7 +42,7 @@ Windows 自动走忙等引擎）：
 using PrecisionDeadlineTimer;
 using var cts = new CancellationTokenSource();
 
-// 200 ms 周期示例：忙等窗口取周期的 7.5%；rtPriority 仅 Linux 生效
+// 200 ms 周期示例：显式使用 15 ms 忙等窗口，需按目标机器复测；rtPriority 仅 Linux 生效
 var timer = new CrossPlatformTimer(
     spinWindow: TimeSpan.FromMilliseconds(15),
     rtPriority: 50);
@@ -70,14 +70,43 @@ void OnTick(TimerTick tick)
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `spinWindow` | 1.5 ms | 忙等窗口上限。CPU ≈ 窗口 ÷ 周期；经验公式 `clamp(周期 × 7.5%, 2 ms, 15 ms)` |
+| `spinWindow` | 1.5 ms | 忙等窗口上限，实际不超过周期；按目标机器的唤醒延迟与 CPU 预算复测选取，见下文 |
 | `latePolicy` | `KeepSchedule` | `KeepSchedule`：迟到后下一周期缩短以重新对齐，零漂移（推荐）；`Rebase`：迟到超阈值就以当前时刻重排，抑制短周期但时间表漂移 |
 | `rebaseAfter` | 0.1 ms | Rebase 策略的重排阈值；KeepSchedule 下无效 |
 | `useMmcss` | true | 注册 MMCSS "Pro Audio" 调度类并解除 Win11 后台进程定时器节流；失败静默退化 |
-| `minSpinWindow` | = spinWindow | 设得更小则窗口自适应收缩省电（CPU 可降到 2~4%），代价是 P99 精度降到 0.5~2.5 ms 量级 |
+| `minSpinWindow` | = spinWindow | 等于上限时窗口固定；设得更小则自适应收缩以减少忙等，精度和 CPU 变化取决于机器与负载 |
 
-窗口为什么钳在 2~15 ms：小于约 2 ms 会因等待定时器 0.5 ms 粒度加唤醒抖动而频繁"晚醒出窗"；
-大于约 15 ms 无收益——更大的迟到是线程被抢占，忙等救不回来，只能靠 MMCSS 从调度层面压制。
+`interval-ms` 指采样周期 T，`spin-ms` 指截止点前的忙等窗口上限 S。Windows 引擎将
+S 限制为不超过 T，计划在截止点前 S 毫秒结束系统等待，再忙等到截止点；实际返回时刻受调度影响。
+省略 `--min-spin-ms` 时窗口固定；显式设置更小的下限时，实际窗口会在上下限之间调整。
+
+单定时线程、回调工作很少且按时提前唤醒时，理论忙等 CPU 占用约为 `min(S, T) / T`，
+其中 100% 表示一个逻辑核。实际占用还受等待返回延迟、回调耗时和其他开销影响。
+当 S 不小于 T 时，空闲等待部分趋于全程忙等，仍不能避免被系统中断或其他任务抢占。
+
+旧经验公式 `clamp(T × 7.5%, 2 ms, 15 ms)` 的含义是将窗口限制在 2～15 ms，
+它是历史参数试选方法，不是精度保证，也不是代码自动计算窗口的规则：
+
+| 周期 T | 旧公式窗口 | 理论忙等 CPU（一个逻辑核） |
+| ---: | ---: | ---: |
+| 5 ms | 2 ms | 40% |
+| 20 ms | 2 ms | 10% |
+| 100 ms | 7.5 ms | 7.5% |
+| 1000 ms | 15 ms | 1.5% |
+
+窗口主要用于留出系统等待晚返回的余量；这类延迟不与采样周期保持固定比例。
+因此，不能用周期的固定百分比推导 ±0.1 ms 精度，也不能断言小于 2 ms 一定不够、
+大于 15 ms 一定无收益。提高窗口对已经进入忙等后的抢占也不能提供最坏延迟保证。
+
+修正基准的 Windows 优先级设置顺序后，本机 MMCSS Critical + 固定 1.5 ms 窗口，
+20 ms 周期测 100 秒、5 ms 周期测 30 秒均未观察到超过 0.1 ms 的周期误差；
+20 ms 周期另一次 20 秒诊断中，将窗口从 1.5 增至 5 ms，CPU 从 4.9% 增至 22.5%，
+最大周期误差分别为 0.0610 和 0.0632 ms，未观察到精度改善。
+这些有限时长、无模拟回调工作的结果支持从 1.5 ms 开始复测，不证明它对所有周期或机器最优。
+
+选取窗口时先固定 MMCSS 配置和回调负载，再比较不同窗口的 P99.9、最大周期误差、
+最大相位误差、超限与跳过次数、CPU；保留达到实际验收要求的较小窗口。
+库的默认窗口为 1.5 ms，基准程序省略 `--spin-ms` 时默认为 15 ms；两者均不自动应用旧公式。
 
 ## 回调编写规范
 
@@ -112,7 +141,7 @@ void OnTick(TimerTick tick)
 | 长周期（数百 ms）下出现 2.5~11.5 ms 离散尖峰 | Win11 对后台进程的 EcoQoS 定时器合并 | `useMmcss: true`（已自动解除）；`timeBeginPeriod` 单独调用无效 |
 | P99 突然变差、跳过点持续上升 | 回调耗时逼近预算上限 | 按上面的公式核算；瘦身回调 |
 | 首几秒误差大 | JIT 编译与冷启动 | 预热后统计，或忽略启动段 |
-| CPU 偏高 | 窗口占空比 = 窗口 ÷ 周期 | 长周期按比例放宽窗口即可接受；短周期用 `minSpinWindow` 自适应 |
+| CPU 偏高 | 理论忙等占空比约为窗口 ÷ 周期 | 在满足实测精度的前提下缩小窗口；使用 `minSpinWindow` 自适应后需重新验证尾部误差 |
 | 取消后 Run 不返回 | 回调正在执行阻塞操作 | 取消只能打断等待，不能中断已进入的回调 |
 | 系统睡眠/重启后时间线异常 | 设计行为 | 睡眠期算作跳过周期并计数，唤醒后回到原时间表 |
 
@@ -221,11 +250,49 @@ WSL2 最大唤醒迟到从 3.5 ms 压到 0.36 ms，进一步佐证）。**精度
 
 - 引擎无需显式选择（`auto` 在非 Linux 平台自动选 spin）；MMCSS 保持默认开启，
   它会同时解除 Win11 对后台进程的定时器节流；
-- 忙等窗口按 `clamp(周期 × 7.5~10%, 2 ms, 15 ms)` 选取；省电场景用 `minSpinWindow` 自适应；
+- 忙等窗口可从固定 1.5 ms 开始复测，根据实际唤醒延迟和 CPU 预算调整；
+  5 ms 与 20 ms 周期已有本机测试，其他周期需另测。省电场景用 `minSpinWindow` 自适应后重新验收；
 - **空载/间歇负载必须处理电源管理**（本次实测的关键结论）：
   `powercfg /setactive SCHEME_MIN` 切到高性能电源计划（高性能计划默认禁用核停车），
   或接受空载时数 ms 级的偶发迟到；负载稳定的产线环境无此问题；
 - 回调纪律见"回调编写规范"：短小、不分配、不阻塞；监控 SkippedPeriods 告警。
+
+Windows 可通过 `MmcssPriority` 初始化属性选择 MMCSS 任务内的相对优先级。
+默认 `Normal` 保持原配置；`High` / `Critical` 是需要在目标机器上比较的调度选项：
+
+```csharp
+var timer = new CrossPlatformTimer(spinWindow: TimeSpan.FromMilliseconds(1.5))
+{
+    MmcssPriority = WindowsMmcssPriority.Critical
+};
+```
+
+基准程序支持 `--mmcss-priority normal|high|critical`，例如：
+
+```powershell
+dotnet run --project TimerBenchmark -c Release -- --engine spin --interval-ms 20 --spin-ms 1.5 --mmcss true --mmcss-priority critical --priority above --warmup-seconds 20 --seconds 100 --tolerance-ms 0.1 --output windows-critical.csv
+```
+
+该选项调用 `AvSetMmThreadPriority`，只调整注册的 "Pro Audio" 任务内相对优先级。
+它依赖 MMCSS 注册和优先级设置成功，不改变进程优先级，也不提供最坏唤醒延迟保证。
+`useMmcss: false` 时不生效；Linux 引擎忽略此属性。应同时比较 P99.9、最大误差、
+超限次数和 CPU，避免只按 P99 选择配置。
+[API 语义](https://learn.microsoft.com/en-us/windows/win32/api/avrt/nf-avrt-avsetmmthreadpriority)。
+
+普通 `Thread.Priority` 应在调用 `Run` 前设置。不要在 MMCSS 已注册后的回调中再设为
+`AboveNormal` / `Normal`：这会重设 Windows 的线程基础优先级。基准程序已经将 Windows
+优先级设置移到 `Run` 前；历史基准版本在首个回调中设置，复测时请注明版本。
+
+修正后的本机 Windows 复测（2026-10，20 ms 周期、1.5 ms 窗口、MMCSS Critical、
+预热 20 秒测 100 秒）：P99 周期误差 0.0458 ms、P99.9 0.0870 ms、最大 0.0897 ms，
+4999 个完整周期零超限（0.1 ms）、零跳过，最大相位 0.0914 ms，CPU 6.8%。
+5 ms 周期补测 30 秒：最大周期误差 0.0821 ms、零超限、CPU 24.7%。
+这些是本机无模拟回调工作下的有限时长结果。
+
+随后用户同配置测量 580 秒，28999 个完整周期中有 22 个超过 0.1 ms（0.0759%），
+最大周期误差 0.2734 ms、最大相位 0.2741 ms，首尾累计偏差 −0.0001 ms。
+因此上述 100 秒零超限不能证明长期所有周期达标。本机进一步诊断也复现了在提前唤醒后、
+忙等阶段发生的尖峰；加宽窗口和绑定性能核的短测均仍有越界。
 
 ### Linux（linux 引擎）
 
